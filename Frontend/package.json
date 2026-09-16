@@ -1,14 +1,13 @@
 {
-  "name": "mslx-plugin-demo",
+  "name": "mslx-plugin-migrate",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc -b && vite build",
     "build:watch": "vite build --watch",
-    "preview": "vite preview --port 5001 --strictPort",
-    "dev:plugin": "concurrently -n \"BUILD,SERVE\" -c \"blue,green\" \"pnpm build:watch\" \"pnpm preview\""
+    "preview": "vite preview --port 5001 --strictPort"
   },
   "dependencies": {
     "vue": "^3.5.32"
