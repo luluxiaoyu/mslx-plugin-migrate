@@ -18,6 +18,10 @@
           </div>
 
           <div class="flex items-center gap-2">
+            <t-button variant="outline" theme="default" size="small" :loading="loading || backupsLoading" @click="refreshAll">
+              <template #icon><refresh-icon /></template>
+              刷新
+            </t-button>
             <t-button theme="primary" variant="outline" size="small" @click="openExportDialog">
               <template #icon><download-icon /></template>
               导出迁移包
@@ -31,18 +35,18 @@
 
         <!-- 卡片主体内容 -->
         <div class="text-sm text-[var(--td-text-color-secondary)] leading-relaxed">
-          一键将本机的 Minecraft 服务端实例、FRP 内网穿透隧道、系统设置及用户数据打包导出为 Zip 归档，或在新服务器上一键还原并自动自适应修正实例路径。
+          将本机的服务端实例、FRP 穿透隧道、系统设置及用户数据打包导出为迁移文件，或在当前面板中快速还原。
         </div>
 
         <!-- 警告提示（严格无Emoji） -->
         <t-alert theme="warning" :close="false" class="mt-4">
-          建议关闭所有服务端后再备份，否则可能会失败。
+          建议关闭正在运行的服务端后再进行操作，以保证数据完整性。
         </t-alert>
 
         <!-- 统计信息 -->
         <div class="flex items-center gap-3 mt-5 mb-3">
           <span class="text-xs font-extrabold text-[var(--td-text-color-secondary)] uppercase tracking-widest">
-            当前数据概览
+            数据统计
           </span>
           <div class="h-px bg-zinc-200/60 dark:bg-zinc-700/60 flex-1"></div>
         </div>
@@ -97,10 +101,14 @@
           </div>
         </div>
 
-        <div v-if="backups.length === 0" class="p-6 text-center rounded-xl bg-zinc-50 dark:bg-zinc-800/30 border border-dashed border-zinc-200 dark:border-zinc-700/60">
+        <div v-if="backups.length === 0" class="p-6 text-center rounded-xl bg-zinc-50 dark:bg-zinc-800/30 border border-dashed border-zinc-200 dark:border-zinc-700/60 flex flex-col items-center justify-center gap-2">
           <span class="text-xs text-[var(--td-text-color-placeholder)]">
-            暂无已完成的备份数据包。点击右上角【导出迁移包】即可开始打包。
+            暂无已生成的迁移包
           </span>
+          <t-button size="small" variant="outline" theme="default" :loading="backupsLoading" @click="fetchBackups">
+            <template #icon><refresh-icon /></template>
+            刷新列表
+          </t-button>
         </div>
 
         <div v-else class="flex flex-col gap-2">
@@ -143,54 +151,54 @@
       v-model:visible="exportVisible"
       header="导出整机迁移包"
       width="620px"
-      :confirm-btn="exportLoading ? '提交中...' : '开始导出'"
+      :confirm-btn="exportLoading ? '正在导出...' : '开始导出'"
       :confirm-btn-props="{ loading: exportLoading }"
       @confirm="submitExport"
     >
       <div class="py-2 flex flex-col gap-4">
         <t-alert theme="warning" :close="false">
-          建议关闭所有服务端后再备份，否则可能会失败。
+          建议关闭正在运行的服务端后再进行操作，以保证数据完整性。
         </t-alert>
 
         <div class="text-xs text-[var(--td-text-color-secondary)]">
-          勾选需要导出的内容。导出任务将在宿主后台异步执行，可在顶部任务中心查看实时进度。
+          选择需要导出的数据项，导出任务将在后台异步执行。
         </div>
 
         <div class="flex flex-col gap-3 p-4 bg-zinc-50 dark:bg-zinc-800/50 rounded-xl border border-zinc-200 dark:border-zinc-700/60">
           <t-checkbox v-model="exportOptions.ExportServers">
-            <span class="font-bold text-[var(--td-text-color-primary)]">服务端实例数据</span> (含核心、存档、插件及配置)
+            <span class="font-bold text-[var(--td-text-color-primary)]">服务端实例</span>
           </t-checkbox>
           <div
             v-if="exportOptions.ExportServers && summary.servers.length > 0"
             class="ml-6 pl-3 border-l-2 border-zinc-200 dark:border-zinc-700 flex flex-col gap-1.5 max-h-40 overflow-y-auto"
           >
             <div class="flex items-center justify-between text-xs text-[var(--td-text-color-placeholder)] mb-1">
-              <span>选择实例（默认全部）：</span>
+              <span>选择要导出的实例：</span>
               <a class="cursor-pointer text-[var(--color-primary)]" @click="toggleSelectAllServers">
                 {{ exportOptions.SelectedServerIds.length === summary.servers.length ? '取消全选' : '全选' }}
               </a>
             </div>
             <t-checkbox-group v-model="exportOptions.SelectedServerIds">
               <div v-for="srv in summary.servers" :key="srv.id" class="text-xs py-0.5">
-                <t-checkbox :value="srv.id">{{ srv.name }} (ID: {{ srv.id }})</t-checkbox>
+                <t-checkbox :value="srv.id">{{ srv.name }}</t-checkbox>
               </div>
             </t-checkbox-group>
           </div>
 
           <t-checkbox v-model="exportOptions.ExportFrp">
-            <span class="font-bold text-[var(--td-text-color-primary)]">FRP 内网穿透隧道配置</span>
+            <span class="font-bold text-[var(--td-text-color-primary)]">FRP 隧道配置</span>
           </t-checkbox>
 
           <t-checkbox v-model="exportOptions.ExportUsers">
-            <span class="font-bold text-[var(--td-text-color-primary)]">用户数据</span> (账号、权限、密码哈希)
+            <span class="font-bold text-[var(--td-text-color-primary)]">用户数据</span>
           </t-checkbox>
 
           <t-checkbox v-model="exportOptions.ExportSystemSettings">
-            <span class="font-bold text-[var(--td-text-color-primary)]">系统全局设置</span>
+            <span class="font-bold text-[var(--td-text-color-primary)]">系统设置</span>
           </t-checkbox>
 
           <t-checkbox v-model="exportOptions.ExportPlugins">
-            <span class="font-bold text-[var(--td-text-color-primary)]">插件与插件数据</span>
+            <span class="font-bold text-[var(--td-text-color-primary)]">插件数据</span>
           </t-checkbox>
         </div>
       </div>
@@ -201,24 +209,24 @@
       v-model:visible="importVisible"
       header="导入整机迁移包"
       width="680px"
-      :confirm-btn="importLoading ? '正在处理中...' : '开始导入'"
+      :confirm-btn="importLoading ? '正在处理...' : '开始导入'"
       :confirm-btn-props="{ loading: importLoading, disabled: !canSubmitImport }"
       @confirm="submitImport"
     >
       <div class="py-2 flex flex-col gap-4">
-        <t-alert theme="warning" :close="false">
-          系统采用<b>纯追加导入模式</b>：遇到同 ID 实例或隧道将自动递增分配新 ID，绝不覆盖已有数据；遇到重名用户自动跳过；系统设置将自动保留本机的端口、IP 与 JWT 密钥。
+        <t-alert theme="info" :close="false">
+          导入采用追加模式，不会覆盖当前已有实例、隧道及同名用户。
         </t-alert>
 
         <!-- 导入模式切换 -->
         <t-radio-group v-model="importMode" variant="default-filled">
           <t-radio-button value="localFolder">
             <template #icon><folder-open-icon /></template>
-            从服务端 Imports 目录导入
+            本地目录导入
           </t-radio-button>
           <t-radio-button value="hostUpload" :disabled="!hasHostUpload">
             <template #icon><upload-icon /></template>
-            宿主上传导入 {{ !hasHostUpload ? '(未检测到宿主组件)' : '' }}
+            上传文件导入
           </t-radio-button>
         </t-radio-group>
 
@@ -227,24 +235,31 @@
           <div class="p-3.5 bg-zinc-50 dark:bg-zinc-800/40 rounded-xl border border-zinc-200 dark:border-zinc-700/60 text-xs text-[var(--td-text-color-secondary)]">
             <div class="font-bold text-[var(--td-text-color-primary)] mb-1 flex items-center gap-1.5">
               <file-icon class="text-[var(--color-primary)]" />
-              文件存放引导
+              文件存放目录
             </div>
-            请将需要导入的 <b>.zip</b> 迁移包直接上传或放置在服务端的以下目录中：
+            请将需要导入的 Zip 文件上传或放置到服务器以下路径：
             <div class="mt-1.5 p-2 bg-white dark:bg-zinc-900 rounded border border-zinc-200 dark:border-zinc-700 font-mono text-[11px] text-[var(--color-primary)] break-all select-all">
-              {{ summary.importsPath || '正在获取插件数据路径...' }}
+              {{ summary.importsPath || '正在获取路径...' }}
             </div>
           </div>
 
           <div class="flex items-center justify-between">
-            <span class="text-xs font-bold text-[var(--td-text-color-secondary)]">选择要导入的文件：</span>
+            <div class="flex items-center gap-2">
+              <span class="text-xs font-bold text-[var(--td-text-color-secondary)]">已有导入包：</span>
+              <span class="text-xs font-mono text-[var(--td-text-color-placeholder)]">({{ importFiles.length }})</span>
+            </div>
             <t-button variant="text" size="small" theme="primary" :loading="importFilesLoading" @click="fetchImportFiles">
               <template #icon><refresh-icon /></template>
-              刷新扫描
+              刷新列表
             </t-button>
           </div>
 
-          <div v-if="importFiles.length === 0" class="p-5 text-center rounded-xl bg-zinc-50 dark:bg-zinc-800/30 border border-dashed border-zinc-200 dark:border-zinc-700/60 text-xs text-[var(--td-text-color-placeholder)]">
-            {{ importFilesLoading ? '正在扫描目录...' : '未在 Imports 目录下检测到任何 .zip 文件，请按上方提示放置文件后点击刷新。' }}
+          <div v-if="importFiles.length === 0" class="p-5 text-center rounded-xl bg-zinc-50 dark:bg-zinc-800/30 border border-dashed border-zinc-200 dark:border-zinc-700/60 flex flex-col items-center justify-center gap-2 text-xs text-[var(--td-text-color-placeholder)]">
+            <span>{{ importFilesLoading ? '正在读取文件列表...' : '未检测到可导入的 Zip 文件，请将文件放入指定目录后刷新。' }}</span>
+            <t-button v-if="!importFilesLoading" size="small" variant="outline" theme="default" @click="fetchImportFiles">
+              <template #icon><refresh-icon /></template>
+              刷新列表
+            </t-button>
           </div>
 
           <t-radio-group v-else v-model="selectedLocalFile" class="flex flex-col gap-2 max-h-48 overflow-y-auto pr-1">
@@ -269,16 +284,43 @@
         <!-- 方式 2: 调用宿主上传组件 -->
         <div v-else-if="importMode === 'hostUpload'" class="flex flex-col gap-3">
           <div
-            class="p-6 border-2 border-dashed border-zinc-300 dark:border-zinc-700 rounded-xl flex flex-col items-center justify-center gap-3 bg-zinc-50/50 dark:bg-zinc-800/20"
+            class="relative p-6 border-2 border-dashed rounded-xl flex flex-col items-center justify-center gap-3 transition-all duration-200 cursor-pointer select-none"
+            :class="isDragOver
+              ? 'border-[var(--color-primary)] bg-[var(--color-primary-light)]/15 scale-[1.01]'
+              : 'border-zinc-300 dark:border-zinc-700 bg-zinc-50/50 dark:bg-zinc-800/20 hover:border-[var(--color-primary)]/60'"
+            @dragenter.prevent="onDragEnter"
+            @dragover.prevent="onDragOver"
+            @dragleave.prevent="onDragLeave"
+            @drop.prevent="onFileDrop"
+            @click="triggerFileInput"
           >
             <input ref="fileInput" type="file" accept=".zip" class="hidden" @change="handleFileChange" />
-            <t-button theme="default" variant="dashed" @click="triggerFileInput" :disabled="importLoading">
-              <template #icon><folder-open-icon /></template>
-              选择迁移 Zip 文件
-            </t-button>
-            <span class="text-xs text-[var(--td-text-color-secondary)] font-mono">
-              {{ selectedUploadFile ? selectedUploadFile.name + ' (' + formatSize(selectedUploadFile.size) + ')' : '未选择文件' }}
-            </span>
+            <div
+              class="pointer-events-none w-12 h-12 rounded-full flex items-center justify-center transition-colors"
+              :class="isDragOver ? 'bg-[var(--color-primary)] text-white' : 'bg-zinc-200/60 dark:bg-zinc-700/60 text-zinc-500 dark:text-zinc-400'"
+            >
+              <upload-icon class="text-2xl" />
+            </div>
+            <div class="pointer-events-none flex flex-col items-center gap-1 text-center">
+              <div class="text-xs font-bold text-[var(--td-text-color-primary)]">
+                {{ isDragOver ? '释放鼠标以上传文件' : (selectedUploadFile ? '点击或拖拽文件可更换' : '点击选择或拖拽迁移包至此处') }}
+              </div>
+              <div class="text-[11px] text-[var(--td-text-color-placeholder)]">
+                仅支持 .zip 格式的整机迁移包
+              </div>
+            </div>
+            <div
+              v-if="selectedUploadFile"
+              class="mt-1 px-3 py-1.5 rounded-lg bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 flex items-center gap-2 text-xs font-mono text-[var(--td-text-color-primary)] shadow-sm"
+              @click.stop
+            >
+              <file-icon class="text-base text-[var(--color-primary)]" />
+              <span class="truncate max-w-[280px]" :title="selectedUploadFile.name">{{ selectedUploadFile.name }}</span>
+              <span class="text-[11px] text-[var(--td-text-color-placeholder)]">({{ formatSize(selectedUploadFile.size) }})</span>
+              <t-button size="small" variant="text" theme="danger" class="ml-1 !p-0.5" @click="selectedUploadFile = null">
+                <template #icon><delete-icon /></template>
+              </t-button>
+            </div>
           </div>
 
           <!-- 宿主上传动态进度条 -->
@@ -292,21 +334,21 @@
         </div>
 
         <div class="flex flex-col gap-2.5 p-4 bg-zinc-50 dark:bg-zinc-800/50 rounded-xl border border-zinc-200 dark:border-zinc-700/60 text-xs">
-          <span class="font-bold text-[var(--td-text-color-primary)]">还原选项（智能追加与安全隔离）：</span>
+          <span class="font-bold text-[var(--td-text-color-primary)]">导入项目：</span>
           <t-checkbox v-model="importOptions.ImportServers">
-            追加还原服务端实例（遇 ID 冲突自动分配新 ID，自适应修正根目录路径）
+            服务端实例
           </t-checkbox>
           <t-checkbox v-model="importOptions.ImportFrp">
-            追加还原 FRP 隧道配置（遇 ID 冲突自动分配新 ID）
+            FRP 隧道配置
           </t-checkbox>
           <t-checkbox v-model="importOptions.ImportUsers">
-            追加还原用户数据（遇重名账号安全跳过，绝不影响当前管理员）
+            用户数据
           </t-checkbox>
           <t-checkbox v-model="importOptions.ImportSystemSettings">
-            合并通用系统设置（严格保护本机监听端口、IP、JWT密钥及从机连接凭证）
+            系统通用设置
           </t-checkbox>
           <t-checkbox v-model="importOptions.ImportPlugins">
-            还原插件与插件数据
+            插件数据
           </t-checkbox>
         </div>
       </div>
@@ -396,6 +438,10 @@ const fetchBackups = async () => {
   }
 };
 
+const refreshAll = async () => {
+  await Promise.all([fetchSummary(), fetchBackups()]);
+};
+
 onMounted(() => {
   fetchSummary();
   fetchBackups();
@@ -429,6 +475,24 @@ const toggleSelectAllServers = () => {
   }
 };
 
+// 触发宿主后台任务 Pinia store 刷新并启动轮询
+const triggerHostTaskRefresh = () => {
+  try {
+    const stores = (window as any).MSLX_Stores;
+    if (stores && typeof stores.useTaskStore === 'function') {
+      const taskStore = stores.useTaskStore();
+      if (typeof taskStore.fetchTasks === 'function') {
+        taskStore.fetchTasks();
+      }
+      if (typeof taskStore.startPolling === 'function') {
+        taskStore.startPolling();
+      }
+    }
+  } catch (err) {
+    console.warn('[MSLX Migration] 刷新宿主任务状态失败:', err);
+  }
+};
+
 const submitExport = async () => {
   if (!request) return;
   try {
@@ -438,14 +502,17 @@ const submitExport = async () => {
       data: exportOptions
     });
     exportVisible.value = false;
-    MessagePlugin.success('整机导出任务已在后台启动！可在右上角任务中心查看实时进度。');
+    MessagePlugin.success('导出任务已创建，可在任务中心查看进度');
+
+    // 立即通知宿主任务中心刷新并启动轮询
+    triggerHostTaskRefresh();
     
     // 延迟轮询刷新历史列表
     setTimeout(() => {
       fetchBackups();
     }, 3000);
   } catch (e: any) {
-    MessagePlugin.error(e.message || '提交导出任务失败');
+    MessagePlugin.error(e.message || '导出任务创建失败');
   } finally {
     exportLoading.value = false;
   }
@@ -465,10 +532,10 @@ const deleteFile = async (fileName: string) => {
     await request.delete({
       url: `/api/plugin/mslx-plugin-migrate/migration/backups/${encodeURIComponent(fileName)}`
     });
-    MessagePlugin.success('备份包已删除');
+    MessagePlugin.success('文件已删除');
     fetchBackups();
   } catch (e: any) {
-    MessagePlugin.error(e.message || '删除备份包失败');
+    MessagePlugin.error(e.message || '删除失败');
   }
 };
 
@@ -487,6 +554,9 @@ const selectedUploadFile = ref<File | null>(null);
 const uploadStatusText = ref('');
 const uploadPercent = ref(0);
 const hostUploadHook = hasHostUpload ? (window as any).useFileUpload() : null;
+
+const dragCounter = ref(0);
+const isDragOver = computed(() => dragCounter.value > 0);
 
 const importOptions = reactive({
   ImportServers: true,
@@ -520,6 +590,7 @@ const openImportDialog = () => {
   importVisible.value = true;
   selectedUploadFile.value = null;
   selectedLocalFile.value = '';
+  dragCounter.value = 0;
   uploadPercent.value = 0;
   uploadStatusText.value = '';
   // 若未检测到宿主上传则默认模式锁定为 localFolder
@@ -537,13 +608,51 @@ const canSubmitImport = computed(() => {
 });
 
 const triggerFileInput = () => {
-  fileInput.value?.click();
+  if (!importLoading.value) {
+    fileInput.value?.click();
+  }
 };
 
 const handleFileChange = (e: Event) => {
   const files = (e.target as HTMLInputElement).files;
   if (files && files.length > 0) {
-    selectedUploadFile.value = files[0];
+    const file = files[0];
+    if (!file.name.toLowerCase().endsWith('.zip')) {
+      MessagePlugin.warning('仅支持上传 .zip 格式的迁移包文件');
+      return;
+    }
+    selectedUploadFile.value = file;
+  }
+};
+
+const onDragEnter = (e: DragEvent) => {
+  e.preventDefault();
+  if (importLoading.value) return;
+  dragCounter.value++;
+};
+
+const onDragOver = (e: DragEvent) => {
+  e.preventDefault();
+};
+
+const onDragLeave = (e: DragEvent) => {
+  e.preventDefault();
+  dragCounter.value = Math.max(0, dragCounter.value - 1);
+};
+
+const onFileDrop = (e: DragEvent) => {
+  e.preventDefault();
+  dragCounter.value = 0;
+  if (importLoading.value) return;
+
+  const files = e.dataTransfer?.files;
+  if (files && files.length > 0) {
+    const file = files[0];
+    if (!file.name.toLowerCase().endsWith('.zip')) {
+      MessagePlugin.warning('仅支持上传 .zip 格式的迁移包文件');
+      return;
+    }
+    selectedUploadFile.value = file;
   }
 };
 
@@ -553,7 +662,7 @@ const submitImport = async () => {
   if (importMode.value === 'localFolder') {
     // 方式 1: 直接指定服务端 Imports 目录下的文件名导入
     if (!selectedLocalFile.value) {
-      MessagePlugin.warning('请选择需要导入的 Zip 文件');
+      MessagePlugin.warning('请选择需要导入的文件');
       return;
     }
 
@@ -567,22 +676,23 @@ const submitImport = async () => {
         }
       });
 
-      MessagePlugin.success('整机导入任务已在后台启动！可在右上角任务中心查看实时进度。');
+      MessagePlugin.success('导入任务已创建，可在任务中心查看进度');
       importVisible.value = false;
+      triggerHostTaskRefresh();
       fetchSummary();
     } catch (e: any) {
-      MessagePlugin.error(e.message || '启动导入任务失败');
+      MessagePlugin.error(e.message || '导入任务创建失败');
     } finally {
       importLoading.value = false;
     }
   } else {
     // 方式 2: 调用宿主上传组件上传文件后通过 uploadId 导入
     if (!hasHostUpload || !hostUploadHook) {
-      MessagePlugin.error('当前宿主未挂载 useFileUpload 上传组件，请切换至服务端 Imports 目录导入方式');
+      MessagePlugin.error('未检测到宿主上传组件，请使用本地目录导入');
       return;
     }
     if (!selectedUploadFile.value) {
-      MessagePlugin.warning('请先选择迁移 Zip 文件');
+      MessagePlugin.warning('请选择迁移文件');
       return;
     }
 
@@ -591,26 +701,26 @@ const submitImport = async () => {
     try {
       importLoading.value = true;
       uploadPercent.value = 0;
-      uploadStatusText.value = '准备使用宿主上传组件上传...';
+      uploadStatusText.value = '正在准备上传...';
 
       const stopWatch = watch(
         () => hostUploadHook.uploadProgress.value,
         (val: number) => {
           uploadPercent.value = Math.min(Math.round(val), 98);
-          uploadStatusText.value = `宿主极速并发上传中: ${uploadPercent.value}% (${hostUploadHook.uploadedFileSize.value || ''})`;
+          uploadStatusText.value = `正在上传文件: ${uploadPercent.value}%`;
         },
         { immediate: true }
       );
 
       let uploadId = '';
       try {
-        uploadStatusText.value = '正在通过宿主分片引擎上传...';
+        uploadStatusText.value = '正在上传文件...';
         uploadId = await hostUploadHook.startUpload(file);
       } finally {
         stopWatch();
       }
 
-      uploadStatusText.value = '文件上传合并成功，正在启动后台解压与追加还原任务...';
+      uploadStatusText.value = '上传完成，正在创建导入任务...';
       uploadPercent.value = 100;
 
       await request.post({
@@ -621,8 +731,9 @@ const submitImport = async () => {
         }
       });
 
-      MessagePlugin.success('整机导入任务已在后台启动！可在右上角任务中心查看实时进度。');
+      MessagePlugin.success('导入任务已创建，可在任务中心查看进度');
       importVisible.value = false;
+      triggerHostTaskRefresh();
       fetchSummary();
     } catch (e: any) {
       MessagePlugin.error(e.message || '上传或导入失败');

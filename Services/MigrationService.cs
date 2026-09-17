@@ -12,6 +12,7 @@ using MSLX.Plugin.Migrate.Models;
 using MSLX.SDK;
 using MSLX.SDK.Models;
 using MSLX.SDK.Models.Files;
+using System.Collections.Concurrent;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
@@ -22,6 +23,7 @@ public class MigrationService
     private readonly string _appDataPath;
     private readonly string _exportsDir;
     private readonly string _importsDir;
+    private readonly ConcurrentDictionary<string, CancellationTokenSource> _activeTasks = new();
 
     public MigrationService()
     {
@@ -32,6 +34,27 @@ public class MigrationService
 
         if (!Directory.Exists(_exportsDir)) Directory.CreateDirectory(_exportsDir);
         if (!Directory.Exists(_importsDir)) Directory.CreateDirectory(_importsDir);
+    }
+
+    /// <summary>
+    /// 在插件卸载（OnUnload）时中断当前所有正在执行的迁移与导入导出任务
+    /// </summary>
+    public void CancelAllTasks()
+    {
+        foreach (var kvp in _activeTasks)
+        {
+            try
+            {
+                SDK.MSLX.Logger.Warn($"[MSLX Migration] 插件卸载中，正在中断迁移任务: {kvp.Key}");
+                kvp.Value.Cancel();
+                SDK.MSLX.Tasks.SetFailed(kvp.Key, "插件卸载，任务已自动终止");
+            }
+            catch (Exception ex)
+            {
+                SDK.MSLX.Logger.Error($"[MSLX Migration] 中断任务 {kvp.Key} 异常: {ex.Message}");
+            }
+        }
+        _activeTasks.Clear();
     }
 
     public ExportableItemsDto GetExportableItems()
@@ -57,7 +80,13 @@ public class MigrationService
 
         string pluginsDir = Path.Combine(_appDataPath, "Plugins");
         int pluginCount = Directory.Exists(pluginsDir)
-            ? Directory.GetFiles(pluginsDir, "*.dll").Length
+            ? Directory.GetFiles(pluginsDir, "*.dll", SearchOption.AllDirectories).Count(f =>
+            {
+                string fn = Path.GetFileName(f);
+                return !fn.Equals("MSLX.Plugin.Migrate.dll", StringComparison.OrdinalIgnoreCase) &&
+                       !fn.StartsWith("MSLX.Plugin.Migrate", StringComparison.OrdinalIgnoreCase) &&
+                       !fn.StartsWith("mslx-plugin-migrate", StringComparison.OrdinalIgnoreCase);
+            })
             : 0;
 
         return new ExportableItemsDto
@@ -78,13 +107,18 @@ public class MigrationService
         string finalZipPath = Path.Combine(_exportsDir, zipFileName);
         string tempZipPath = Path.Combine(_exportsDir, $"{zipFileName}.tmp");
 
-        var (task, token) = SDK.MSLX.Tasks.CreateTask(
+        var (task, hostToken) = SDK.MSLX.Tasks.CreateTask(
             userId,
             0,
             TaskType.Export,
             "整机迁移包导出",
             zipFileName
         );
+
+        var pluginCts = new CancellationTokenSource();
+        var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(hostToken, pluginCts.Token);
+        var token = linkedCts.Token;
+        _activeTasks[task.Id] = pluginCts;
 
         _ = Task.Run(async () =>
         {
@@ -106,10 +140,12 @@ public class MigrationService
                 using (var zipToOpen = new FileStream(tempZipPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None))
                 using (var archive = new ZipArchive(zipToOpen, ZipArchiveMode.Create))
                 {
+                    token.ThrowIfCancellationRequested();
+
                     // 1. 系统设置 (config.json)
                     if (options.ExportSystemSettings)
                     {
-                        SDK.MSLX.Tasks.UpdateProgress(task.Id, 15, "正在导出系统配置...");
+                        SDK.MSLX.Tasks.UpdateProgress(task.Id, 2, "正在导出系统配置...");
                         string configPath = Path.Combine(SDK.MSLX.Config.GetAppConfigPath(), "config.json");
                         if (File.Exists(configPath))
                         {
@@ -117,10 +153,12 @@ public class MigrationService
                         }
                     }
 
+                    token.ThrowIfCancellationRequested();
+
                     // 2. 用户数据 (Users.json)
                     if (options.ExportUsers)
                     {
-                        SDK.MSLX.Tasks.UpdateProgress(task.Id, 25, "正在导出用户数据...");
+                        SDK.MSLX.Tasks.UpdateProgress(task.Id, 4, "正在导出用户数据...");
                         string usersPath = Path.Combine(SDK.MSLX.Config.GetAppConfigPath(), "Users.json");
                         if (File.Exists(usersPath))
                         {
@@ -128,10 +166,12 @@ public class MigrationService
                         }
                     }
 
+                    token.ThrowIfCancellationRequested();
+
                     // 3. FRP 隧道
                     if (options.ExportFrp)
                     {
-                        SDK.MSLX.Tasks.UpdateProgress(task.Id, 35, "正在导出 FRP 隧道配置...");
+                        SDK.MSLX.Tasks.UpdateProgress(task.Id, 6, "正在导出 FRP 隧道配置...");
                         var allFrp = SDK.MSLX.Config.Frp.GetFrpList();
                         var selectedFrp = options.SelectedFrpIds != null && options.SelectedFrpIds.Any()
                             ? allFrp.Where(f => options.SelectedFrpIds.Contains(f["ID"]?.Value<int>() ?? -1)).ToList()
@@ -149,6 +189,7 @@ public class MigrationService
                         // 打包各自的 frpc 配置文件
                         foreach (var frp in selectedFrp)
                         {
+                            token.ThrowIfCancellationRequested();
                             int frpId = frp["ID"]?.Value<int>() ?? 0;
                             string frpConfigFolder = Path.Combine(SDK.MSLX.Config.GetAppConfigPath(), "Frpc", frpId.ToString());
                             if (Directory.Exists(frpConfigFolder))
@@ -158,17 +199,23 @@ public class MigrationService
                         }
                     }
 
-                    // 4. 插件与插件数据
+                    token.ThrowIfCancellationRequested();
+
+                    // 4. 插件与插件数据（严格排除本迁移插件及其数据目录，防止将自身递归打包导致体积膨胀）
                     if (options.ExportPlugins)
                     {
-                        SDK.MSLX.Tasks.UpdateProgress(task.Id, 45, "正在导出插件数据...");
+                        SDK.MSLX.Tasks.UpdateProgress(task.Id, 8, "正在导出插件数据...");
+                        string pluginDataPath = Path.GetFullPath(MSLXPluginEntry.Instance.Config().GetDataPath());
                         string pluginsDir = Path.Combine(_appDataPath, "Plugins");
                         if (Directory.Exists(pluginsDir))
                         {
                             foreach (var file in Directory.GetFiles(pluginsDir, "*.dll", SearchOption.AllDirectories))
                             {
+                                token.ThrowIfCancellationRequested();
                                 string fileName = Path.GetFileName(file);
-                                if (fileName.Equals("MSLX.Plugin.Migrate.dll", StringComparison.OrdinalIgnoreCase))
+                                if (fileName.Equals("MSLX.Plugin.Migrate.dll", StringComparison.OrdinalIgnoreCase) ||
+                                    fileName.StartsWith("MSLX.Plugin.Migrate", StringComparison.OrdinalIgnoreCase) ||
+                                    fileName.StartsWith("mslx-plugin-migrate", StringComparison.OrdinalIgnoreCase))
                                 {
                                     continue;
                                 }
@@ -181,23 +228,39 @@ public class MigrationService
                         string pluginsDataDir = Path.Combine(_appDataPath, "PluginsData");
                         if (Directory.Exists(pluginsDataDir))
                         {
+                            string fullExportDir = Path.GetFullPath(_exportsDir);
+                            string fullImportDir = Path.GetFullPath(_importsDir);
+
                             foreach (var file in Directory.GetFiles(pluginsDataDir, "*.*", SearchOption.AllDirectories))
                             {
-                                string relToData = Path.GetRelativePath(pluginsDataDir, file);
-                                if (relToData.StartsWith("mslx-plugin-migrate", StringComparison.OrdinalIgnoreCase) ||
-                                    relToData.StartsWith("mslx-plugin-migrate/", StringComparison.OrdinalIgnoreCase) ||
-                                    relToData.StartsWith("mslx-plugin-migrate\\", StringComparison.OrdinalIgnoreCase))
+                                token.ThrowIfCancellationRequested();
+                                string fullFilePath = Path.GetFullPath(file);
+
+                                // 严格排除当前插件自身的 Data 目录（含 Backups 历史备份包、Imports 导入包等）
+                                if (fullFilePath.StartsWith(pluginDataPath, StringComparison.OrdinalIgnoreCase) ||
+                                    fullFilePath.StartsWith(fullExportDir, StringComparison.OrdinalIgnoreCase) ||
+                                    fullFilePath.StartsWith(fullImportDir, StringComparison.OrdinalIgnoreCase))
                                 {
                                     continue;
                                 }
 
-                                string relPath = Path.GetRelativePath(pluginsDataDir, file);
-                                archive.CreateEntryFromFile(file, $"plugins/data/{relPath.Replace('\\', '/')}");
+                                string relToData = Path.GetRelativePath(pluginsDataDir, file).Replace('\\', '/');
+                                var pathSegments = relToData.Split('/', StringSplitOptions.RemoveEmptyEntries);
+                                if (pathSegments.Length > 0 && (
+                                    pathSegments[0].Equals("mslx-plugin-migrate", StringComparison.OrdinalIgnoreCase) ||
+                                    pathSegments[0].Equals("MSLX.Plugin.Migrate", StringComparison.OrdinalIgnoreCase) ||
+                                    pathSegments[0].StartsWith("mslx-plugin-migrate", StringComparison.OrdinalIgnoreCase) ||
+                                    pathSegments[0].StartsWith("MSLX.Plugin.Migrate", StringComparison.OrdinalIgnoreCase)))
+                                {
+                                    continue;
+                                }
+
+                                archive.CreateEntryFromFile(file, $"plugins/data/{relToData}");
                             }
                         }
                     }
 
-                    // 5. 服务端实例
+                    // 5. 服务端实例（占据打包核心进度 10% ~ 92%）
                     if (options.ExportServers)
                     {
                         var allServers = SDK.MSLX.Config.Servers.GetServerList();
@@ -215,20 +278,37 @@ public class MigrationService
                         }
 
                         int totalServers = selectedServers.Count;
+                        int serverStartBase = 10;
+                        int serverEndBase = 92;
+
                         for (int i = 0; i < totalServers; i++)
                         {
+                            token.ThrowIfCancellationRequested();
                             var s = selectedServers[i];
-                            int percent = 50 + (int)((i + 1) / (double)totalServers * 40);
-                            SDK.MSLX.Tasks.UpdateProgress(task.Id, percent, $"正在打包实例 [{s.Name ?? s.ID.ToString()}] ({i + 1}/{totalServers})...");
+                            int sStart = serverStartBase + (int)((double)i / totalServers * (serverEndBase - serverStartBase));
+                            int sEnd = serverStartBase + (int)((double)(i + 1) / totalServers * (serverEndBase - serverStartBase));
+                            string serverLabel = s.Name ?? s.ID.ToString();
+
+                            SDK.MSLX.Tasks.UpdateProgress(task.Id, sStart, $"正在准备打包实例 [{serverLabel}] ({i + 1}/{totalServers})...");
 
                             if (!string.IsNullOrEmpty(s.Base) && Directory.Exists(s.Base))
                             {
-                                AddDirectoryToArchive(archive, s.Base, $"servers/{s.ID}");
+                                AddDirectoryToArchiveWithProgress(
+                                    archive,
+                                    s.Base,
+                                    $"servers/{s.ID}",
+                                    task.Id,
+                                    sStart,
+                                    sEnd,
+                                    $"实例 [{serverLabel}] ({i + 1}/{totalServers})",
+                                    token
+                                );
                             }
                         }
                     }
 
                     // 6. 写入清单 manifest.json
+                    SDK.MSLX.Tasks.UpdateProgress(task.Id, 93, "正在生成迁移清单...");
                     var manifestEntry = archive.CreateEntry("manifest.json");
                     using (var entryStream = manifestEntry.Open())
                     using (var writer = new StreamWriter(entryStream))
@@ -247,13 +327,19 @@ public class MigrationService
             catch (OperationCanceledException)
             {
                 if (File.Exists(tempZipPath)) try { File.Delete(tempZipPath); } catch { }
-                SDK.MSLX.Tasks.SetFailed(task.Id, "用户已取消导出任务");
+                SDK.MSLX.Tasks.SetFailed(task.Id, "导出任务已取消");
             }
             catch (Exception ex)
             {
                 if (File.Exists(tempZipPath)) try { File.Delete(tempZipPath); } catch { }
                 SDK.MSLX.Logger.Error($"[MSLX Migration] 导出异常: {ex.Message}");
                 SDK.MSLX.Tasks.SetFailed(task.Id, $"导出失败: {ex.Message}");
+            }
+            finally
+            {
+                _activeTasks.TryRemove(task.Id, out _);
+                pluginCts.Dispose();
+                linkedCts.Dispose();
             }
         }, token);
 
@@ -315,7 +401,7 @@ public class MigrationService
     public void StartImportTask(string zipFilePath, ImportOptions options, string userId)
     {
         string fileName = Path.GetFileName(zipFilePath);
-        var (task, token) = SDK.MSLX.Tasks.CreateTask(
+        var (task, hostToken) = SDK.MSLX.Tasks.CreateTask(
             userId,
             0,
             TaskType.Decompress,
@@ -323,15 +409,22 @@ public class MigrationService
             fileName
         );
 
+        var pluginCts = new CancellationTokenSource();
+        var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(hostToken, pluginCts.Token);
+        var token = linkedCts.Token;
+        _activeTasks[task.Id] = pluginCts;
+
         _ = Task.Run(async () =>
         {
             string extractTempDir = Path.Combine(_importsDir, $"extract_{Guid.NewGuid():N}");
             try
             {
+                token.ThrowIfCancellationRequested();
                 SDK.MSLX.Tasks.UpdateProgress(task.Id, 10, "正在解压迁移包...", TaskState.Running);
                 Directory.CreateDirectory(extractTempDir);
                 ZipFile.ExtractToDirectory(zipFilePath, extractTempDir, true);
 
+                token.ThrowIfCancellationRequested();
                 string manifestFile = Path.Combine(extractTempDir, "manifest.json");
                 MigrationManifest? manifest = null;
                 if (File.Exists(manifestFile))
@@ -346,7 +439,8 @@ public class MigrationService
                 // 1. 导入系统全局配置（智能合并，严格保护本地网络与安全敏感项）
                 if (options.ImportSystemSettings)
                 {
-                    SDK.MSLX.Tasks.UpdateProgress(task.Id, 30, "正在智能合并系统配置...");
+                    token.ThrowIfCancellationRequested();
+                    SDK.MSLX.Tasks.UpdateProgress(task.Id, 15, "正在智能合并系统配置...");
                     string sourceCfgFile = Path.Combine(extractTempDir, "configs", "config.json");
                     if (File.Exists(sourceCfgFile))
                     {
@@ -373,7 +467,8 @@ public class MigrationService
                 // 2. 导入用户数据（纯追加模式：遇到已存在的同名用户名跳过）
                 if (options.ImportUsers)
                 {
-                    SDK.MSLX.Tasks.UpdateProgress(task.Id, 45, "正在追加导入用户数据...");
+                    token.ThrowIfCancellationRequested();
+                    SDK.MSLX.Tasks.UpdateProgress(task.Id, 18, "正在追加导入用户数据...");
                     string sourceUsersFile = Path.Combine(extractTempDir, "configs", "Users.json");
                     if (File.Exists(sourceUsersFile))
                     {
@@ -397,6 +492,7 @@ public class MigrationService
                         bool changed = false;
                         foreach (var u in sourceUsers)
                         {
+                            token.ThrowIfCancellationRequested();
                             string? username = u["Username"]?.Value<string>();
                             if (string.IsNullOrEmpty(username) || existingUsernames.Contains(username))
                             {
@@ -424,7 +520,8 @@ public class MigrationService
                 // 3. 导入 FRP 隧道配置（纯追加模式：若 ID 冲突自动生成新 ID 追加）
                 if (options.ImportFrp)
                 {
-                    SDK.MSLX.Tasks.UpdateProgress(task.Id, 55, "正在追加恢复 FRP 隧道配置...");
+                    token.ThrowIfCancellationRequested();
+                    SDK.MSLX.Tasks.UpdateProgress(task.Id, 22, "正在追加恢复 FRP 隧道配置...");
                     string frpListPath = Path.Combine(extractTempDir, "configs", "FrpList.json");
                     if (File.Exists(frpListPath))
                     {
@@ -434,6 +531,7 @@ public class MigrationService
 
                         foreach (var item in frpList)
                         {
+                            token.ThrowIfCancellationRequested();
                             int origFrpId = item["ID"]?.Value<int>() ?? 0;
                             string name = item["Name"]?.Value<string>() ?? $"Tunnel_{origFrpId}";
                             string service = item["Service"]?.Value<string>() ?? "";
@@ -463,29 +561,64 @@ public class MigrationService
                     }
                 }
 
-                // 4. 导入插件数据
+                // 4. 导入插件数据（排除迁移插件自身，防止覆盖运行中实例）
                 if (options.ImportPlugins)
                 {
-                    SDK.MSLX.Tasks.UpdateProgress(task.Id, 65, "正在导入插件与插件数据...");
+                    token.ThrowIfCancellationRequested();
+                    SDK.MSLX.Tasks.UpdateProgress(task.Id, 26, "正在导入插件与插件数据...");
                     string pluginBinSourceDir = Path.Combine(extractTempDir, "plugins", "bin");
                     string pluginTargetDir = Path.Combine(_appDataPath, "Plugins");
                     if (Directory.Exists(pluginBinSourceDir))
                     {
-                        DirectoryCopy(pluginBinSourceDir, pluginTargetDir, true);
+                        Directory.CreateDirectory(pluginTargetDir);
+                        foreach (var file in Directory.GetFiles(pluginBinSourceDir, "*.*", SearchOption.AllDirectories))
+                        {
+                            string fileName = Path.GetFileName(file);
+                            if (fileName.Equals("MSLX.Plugin.Migrate.dll", StringComparison.OrdinalIgnoreCase) ||
+                                fileName.StartsWith("MSLX.Plugin.Migrate", StringComparison.OrdinalIgnoreCase) ||
+                                fileName.StartsWith("mslx-plugin-migrate", StringComparison.OrdinalIgnoreCase))
+                            {
+                                continue;
+                            }
+
+                            string rel = Path.GetRelativePath(pluginBinSourceDir, file);
+                            string dest = Path.Combine(pluginTargetDir, rel);
+                            string? dir = Path.GetDirectoryName(dest);
+                            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                            File.Copy(file, dest, true);
+                        }
                     }
 
+                    token.ThrowIfCancellationRequested();
                     string pluginDataSourceDir = Path.Combine(extractTempDir, "plugins", "data");
                     string pluginDataTargetDir = Path.Combine(_appDataPath, "PluginsData");
                     if (Directory.Exists(pluginDataSourceDir))
                     {
-                        DirectoryCopy(pluginDataSourceDir, pluginDataTargetDir, true);
+                        Directory.CreateDirectory(pluginDataTargetDir);
+                        foreach (var file in Directory.GetFiles(pluginDataSourceDir, "*.*", SearchOption.AllDirectories))
+                        {
+                            string rel = Path.GetRelativePath(pluginDataSourceDir, file).Replace('\\', '/');
+                            var pathSegments = rel.Split('/', StringSplitOptions.RemoveEmptyEntries);
+                            if (pathSegments.Length > 0 && (
+                                pathSegments[0].Equals("mslx-plugin-migrate", StringComparison.OrdinalIgnoreCase) ||
+                                pathSegments[0].Equals("MSLX.Plugin.Migrate", StringComparison.OrdinalIgnoreCase) ||
+                                pathSegments[0].StartsWith("mslx-plugin-migrate", StringComparison.OrdinalIgnoreCase) ||
+                                pathSegments[0].StartsWith("MSLX.Plugin.Migrate", StringComparison.OrdinalIgnoreCase)))
+                            {
+                                continue;
+                            }
+
+                            string dest = Path.Combine(pluginDataTargetDir, rel);
+                            string? dir = Path.GetDirectoryName(dest);
+                            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                            File.Copy(file, dest, true);
+                        }
                     }
                 }
 
-                // 5. 导入服务端实例（纯追加模式：若 ID 冲突自动分配新 ID，自适应重写路径并关闭自启）
+                // 5. 导入服务端实例（占据核心进度 30% ~ 95%）
                 if (options.ImportServers)
                 {
-                    SDK.MSLX.Tasks.UpdateProgress(task.Id, 75, "正在自适应恢复服务端实例(纯追加模式)...");
                     string serverListPath = Path.Combine(extractTempDir, "configs", "ServerList.json");
                     if (File.Exists(serverListPath))
                     {
@@ -493,11 +626,18 @@ public class MigrationService
                         var servers = serverArray.Select(s => s.ToObject<McServerInfo.ServerInfo>()!).ToList();
 
                         int count = servers.Count;
+                        int sStartBase = 30;
+                        int sEndBase = 95;
+
                         for (int i = 0; i < count; i++)
                         {
+                            token.ThrowIfCancellationRequested();
                             var s = servers[i];
-                            int percent = 75 + (int)((i + 1) / (double)count * 20);
-                            SDK.MSLX.Tasks.UpdateProgress(task.Id, percent, $"正在自适应恢复实例 [{s.Name ?? s.ID.ToString()}]...");
+                            int instStart = sStartBase + (int)((double)i / count * (sEndBase - sStartBase));
+                            int instEnd = sStartBase + (int)((double)(i + 1) / count * (sEndBase - sStartBase));
+                            string serverLabel = s.Name ?? s.ID.ToString();
+
+                            SDK.MSLX.Tasks.UpdateProgress(task.Id, instStart, $"正在准备恢复实例 [{serverLabel}] ({i + 1}/{count})...");
 
                             // 检查本地 ID 是否冲突
                             bool idConflict = SDK.MSLX.Config.Servers.GetServer((uint)s.ID) != null;
@@ -512,7 +652,15 @@ public class MigrationService
 
                             if (Directory.Exists(sourceServerDir))
                             {
-                                DirectoryCopy(sourceServerDir, targetServerDir, true);
+                                DirectoryCopyWithProgress(
+                                    sourceServerDir,
+                                    targetServerDir,
+                                    task.Id,
+                                    instStart,
+                                    instEnd,
+                                    $"实例 [{serverLabel}] ({i + 1}/{count})",
+                                    token
+                                );
                             }
 
                             s.ID = (int)targetServerId;
@@ -532,6 +680,10 @@ public class MigrationService
                 SDK.MSLX.Tasks.UpdateProgress(task.Id, 100, "整机迁移导入完成！");
                 SDK.MSLX.Tasks.SetSuccess(task.Id, "数据已成功导入并完成自适应路径修复！");
             }
+            catch (OperationCanceledException)
+            {
+                SDK.MSLX.Tasks.SetFailed(task.Id, "导入任务已取消");
+            }
             catch (Exception ex)
             {
                 SDK.MSLX.Logger.Error($"[MSLX Migration] 导入异常: {ex.Message}");
@@ -539,6 +691,10 @@ public class MigrationService
             }
             finally
             {
+                _activeTasks.TryRemove(task.Id, out _);
+                pluginCts.Dispose();
+                linkedCts.Dispose();
+
                 // 清理解压临时目录
                 if (Directory.Exists(extractTempDir))
                 {
@@ -646,6 +802,48 @@ public class MigrationService
         }
     }
 
+    private static void AddDirectoryToArchiveWithProgress(
+        ZipArchive archive,
+        string sourceDir,
+        string entryPrefix,
+        string taskId,
+        int startPercent,
+        int endPercent,
+        string contextLabel,
+        CancellationToken token)
+    {
+        if (!Directory.Exists(sourceDir)) return;
+
+        var allFiles = Directory.GetFiles(sourceDir, "*.*", SearchOption.AllDirectories);
+        int totalFiles = allFiles.Length;
+        if (totalFiles == 0) return;
+
+        int percentSpan = Math.Max(1, endPercent - startPercent);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+
+        for (int i = 0; i < totalFiles; i++)
+        {
+            token.ThrowIfCancellationRequested();
+            var file = allFiles[i];
+            string relPath = Path.GetRelativePath(sourceDir, file).Replace('\\', '/');
+            string entryName = $"{entryPrefix}/{relPath}";
+            archive.CreateEntryFromFile(file, entryName);
+
+            // 每处理 15 个文件或耗时超过 250ms 时汇报一次子进度，避免过度频繁请求
+            if (i == 0 || i == totalFiles - 1 || i % 15 == 0 || sw.ElapsedMilliseconds > 250)
+            {
+                int currentPercent = startPercent + (int)((double)(i + 1) / totalFiles * percentSpan);
+                string fileName = Path.GetFileName(file);
+                SDK.MSLX.Tasks.UpdateProgress(
+                    taskId,
+                    currentPercent,
+                    $"正在打包{contextLabel}: 正在压缩 {fileName} ({i + 1}/{totalFiles})"
+                );
+                sw.Restart();
+            }
+        }
+    }
+
     private static void DirectoryCopy(string sourceDirName, string destDirName, bool copySubDirs)
     {
         var dir = new DirectoryInfo(sourceDirName);
@@ -667,6 +865,54 @@ public class MigrationService
             {
                 string temppath = Path.Combine(destDirName, subdir.Name);
                 DirectoryCopy(subdir.FullName, temppath, copySubDirs);
+            }
+        }
+    }
+
+    private static void DirectoryCopyWithProgress(
+        string sourceDirName,
+        string destDirName,
+        string taskId,
+        int startPercent,
+        int endPercent,
+        string contextLabel,
+        CancellationToken token)
+    {
+        if (!Directory.Exists(sourceDirName)) return;
+
+        var allFiles = Directory.GetFiles(sourceDirName, "*.*", SearchOption.AllDirectories);
+        int totalFiles = allFiles.Length;
+        if (totalFiles == 0) return;
+
+        int percentSpan = Math.Max(1, endPercent - startPercent);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+
+        for (int i = 0; i < totalFiles; i++)
+        {
+            token.ThrowIfCancellationRequested();
+            var srcFile = allFiles[i];
+            string rel = Path.GetRelativePath(sourceDirName, srcFile);
+            string destFile = Path.Combine(destDirName, rel);
+
+            string? parent = Path.GetDirectoryName(destFile);
+            if (!string.IsNullOrEmpty(parent) && !Directory.Exists(parent))
+            {
+                Directory.CreateDirectory(parent);
+            }
+
+            File.Copy(srcFile, destFile, true);
+
+            // 每拷贝 15 个文件或耗时超过 250ms 汇报一次进度
+            if (i == 0 || i == totalFiles - 1 || i % 15 == 0 || sw.ElapsedMilliseconds > 250)
+            {
+                int currentPercent = startPercent + (int)((double)(i + 1) / totalFiles * percentSpan);
+                string fileName = Path.GetFileName(srcFile);
+                SDK.MSLX.Tasks.UpdateProgress(
+                    taskId,
+                    currentPercent,
+                    $"正在恢复{contextLabel}: 正在写入 {fileName} ({i + 1}/{totalFiles})"
+                );
+                sw.Restart();
             }
         }
     }

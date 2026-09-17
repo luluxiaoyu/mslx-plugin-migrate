@@ -17,7 +17,7 @@ public class MSLXPluginEntry : IPlugin
     public string Id => "mslx-plugin-migrate";
     public string Name => "整机文件迁移";
     public string Description => "支持服务端实例、映射隧道、用户数据及系统设置的一键导出与导入迁移。";
-    public string Version => "1.0.0.6";
+    public string Version => "1.0.1";
     public string Icon => "icon.png";
     public string MinSDKVersion => "1.5.2";
     public string Developer => "xiaoyu";
@@ -42,6 +42,16 @@ public class MSLXPluginEntry : IPlugin
 
     public void OnUnload()
     {
+        try
+        {
+            var migrationService = ServiceProvider?.GetService<MigrationService>();
+            migrationService?.CancelAllTasks();
+        }
+        catch (Exception ex)
+        {
+            SDK.MSLX.Logger.Error($"[MSLX Migration] 卸载时清理任务异常: {ex.Message}");
+        }
+
         SDK.MSLX.Logger.Info("MSLX 整机迁移文件插件 (mslx-plugin-migrate) 已卸载。");
     }
 
